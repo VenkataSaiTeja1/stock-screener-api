@@ -1,5 +1,8 @@
 flask
 flask-cors
 yfinance
-openai
+pandas
+pandas-ta
+google-generativeai
 python-dotenv
+gunicorn
