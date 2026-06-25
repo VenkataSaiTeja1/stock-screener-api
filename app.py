@@ -1,5 +1,6 @@
 import os
 import json
+import requests
 import yfinance as yf
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -15,8 +16,56 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Configure Gemini API
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# --- API KEY ROTATION SETUP ---
+keys_env = os.getenv("GEMINI_API_KEYS", "")
+if keys_env:
+    API_KEYS = [k.strip() for k in keys_env.split(",") if k.strip()]
+else:
+    # Fallback to single key if GEMINI_API_KEYS is not defined
+    single_key = os.getenv("GEMINI_API_KEY", "")
+    API_KEYS = [single_key] if single_key else []
+
+current_key_index = 0
+
+def generate_with_retry(prompt, response_mime_type="text/plain"):
+    """
+    Tries to generate content using the current API key.
+    If it hits a rate limit or quota error, it swaps to the next key and retries.
+    """
+    global current_key_index
+    attempts = 0
+    max_attempts = len(API_KEYS) if len(API_KEYS) > 0 else 1
+
+    while attempts < max_attempts:
+        try:
+            # Configure the active key
+            genai.configure(api_key=API_KEYS[current_key_index])
+            
+            # Using 1.5-flash to avoid Google's strict "0-quota" preview limits on new accounts
+            model = genai.GenerativeModel("gemini-2.5-flash") 
+            
+            kwargs = {}
+            if response_mime_type == "application/json":
+                kwargs["generation_config"] = {"response_mime_type": "application/json"}
+                
+            response = model.generate_content(prompt, **kwargs)
+            return response
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            print(f"🛑 RAW GOOGLE ERROR on Key {current_key_index + 1}: {e}")
+            
+            if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+                print(f"⚠️ Key {current_key_index + 1} exhausted/rate-limited. Switching to next key...")
+                current_key_index = (current_key_index + 1) % len(API_KEYS)
+                attempts += 1
+            else:
+                # If it's a different error (like a network timeout), fail immediately
+                raise e
+                
+    raise Exception("All Gemini API keys have exhausted their quota or failed.")
+
+# --------------------------------
 
 def verify_and_clean_ticker(user_query):
     """
@@ -33,15 +82,16 @@ def verify_and_clean_ticker(user_query):
         return "INFY.NS"
         
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
         prompt = f"Resolve company name '{user_query}' to its exact Yahoo Finance ticker symbol. If Indian, append '.NS'. Return ONLY the plain ticker symbol without quotes or formatting."
         
-        response = model.generate_content(prompt)
+        # Use our new rotation engine instead of calling model.generate_content directly
+        response = generate_with_retry(prompt)
         resolved = response.text.strip().replace('"', '').replace("`", "")
         return resolved if resolved else clean_query
     except Exception as e:
         print(f"Ticker resolution error: {e}")
         return clean_query
+
 
 @app.route("/api/search-ticker", methods=["POST"])
 def search_ticker():
@@ -82,13 +132,13 @@ def screen_market():
         
         screener = StockScreener(market)
         
-        # Execute the scan (this will take a few minutes as it pulls OHLCV for 500 stocks)
+        # Execute the scan
         top_stocks, stats, all_stocks = screener.screen_stocks(tickers, max_results=15)
         
-        # Format the data using the provided helper function (CAPTURE BOTH NOW)
+        # Format the data
         top_df, all_df = format_stock_results(top_stocks, all_stocks)
         
-        # Convert the Pandas DataFrames into JSON-serializable lists of dictionaries
+        # Convert DataFrames into JSON-serializable dictionaries
         top_stocks_list = top_df.to_dict(orient="records")
         all_stocks_list = all_df.to_dict(orient="records")
         
@@ -104,6 +154,7 @@ def screen_market():
         print(f"Screener Error: {e}")
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/api/analyze", methods=["POST"])
 def analyze_stock():
     """
@@ -113,7 +164,6 @@ def analyze_stock():
     data = request.json or {}
     user_query = data.get("query", "").strip()
     
-    # Read the history timeframe option from the frontend (default to 5 if not sent)
     history_years = data.get("history_years", 5)
     
     if not user_query:
@@ -125,13 +175,20 @@ def analyze_stock():
         print(f"✅ Resolved to: {ticker}")
         
         print(f"📊 2. Fetching quantitative data from yfinance (Timeframe: {history_years} years)...")
-        stock = yf.Ticker(ticker)
+        
+        # --- SPOOF BROWSER TO BYPASS YAHOO FINANCE RATE LIMITS ---
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        })
+        
+        stock = yf.Ticker(ticker, session=session)
         info = stock.info
         
         if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info):
             if "." in ticker:
                 ticker = ticker.split(".")[0]
-                stock = yf.Ticker(ticker)
+                stock = yf.Ticker(ticker, session=session)
                 info = stock.info
                 
             if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info):
@@ -158,7 +215,6 @@ def analyze_stock():
 
         print(f"🧠 3. Sending data to Gemini (Enforced Window: {history_years} Years)...")
         
-        # Converted to an f-string to pull the dynamic history_years parameter smoothly
         prompt = f"""
 You are an expert institutional equity research analyst. Conduct a thorough 8-tab fundamental analysis for {yf_context['name']} ({yf_context['ticker']}).
 Baseline Financial Profile: {json.dumps(yf_context)}
@@ -219,11 +275,8 @@ You must respond with a strictly valid JSON object matching the exact schema bel
   }}
 }}
 """
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        analysis_response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
-        )
+        # Use our new rotation engine instead of calling model.generate_content directly
+        analysis_response = generate_with_retry(prompt, response_mime_type="application/json")
         
         print("✅ Gemini response received!")
         
