@@ -1,5 +1,6 @@
 """Stock Screening Logic Module"""
 
+import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -42,7 +43,7 @@ class StockScreener:
     def fetch_stock_data(self, ticker: str, period: str = '120d', 
                         interval: str = '1d') -> Optional[pd.DataFrame]:
         """
-        Fetch stock data with error handling
+        Fetch stock data with error handling and Yahoo Finance rate limit bypass
         
         Args:
             ticker: Stock ticker symbol
@@ -53,6 +54,12 @@ class StockScreener:
             DataFrame or None if fetch fails
         """
         try:
+            # --- SPOOF BROWSER TO BYPASS YAHOO FINANCE RATE LIMITS ---
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            })
+            
             data = yf.download(
                 ticker,
                 period=period,
@@ -61,6 +68,7 @@ class StockScreener:
                 auto_adjust=True,
                 group_by='ticker',  # makes single-ticker downloads predictable too
                 threads=False,
+                session=session # Pass the fake browser session
             )
 
             if data is None or data.empty:
@@ -154,7 +162,13 @@ class StockScreener:
         """
         result = {'pe_ratio': None, 'name': 'N/A', 'sector': 'N/A'}
         try:
-            stock = yf.Ticker(ticker)
+            # --- SPOOF BROWSER TO BYPASS YAHOO FINANCE RATE LIMITS ---
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            })
+            
+            stock = yf.Ticker(ticker, session=session) # Pass the fake browser session
             info = stock.info  # single network call
 
             if not info or len(info) <= 1:
@@ -273,7 +287,7 @@ class StockScreener:
         return round(score, 2)
     
     def screen_stocks(self, tickers: List[str], 
-                     max_results: int = 15) -> Tuple[List[Dict], Dict]:
+                     max_results: int = 15) -> Tuple[List[Dict], Dict, List[Dict]]:
         """
         Screen multiple stocks
         
@@ -282,7 +296,7 @@ class StockScreener:
             max_results: Maximum results to return
             
         Returns:
-            Tuple of (filtered_stocks, statistics)
+            Tuple of (filtered_stocks, statistics, all_stocks)
         """
         results = []
         all_stocks = []
